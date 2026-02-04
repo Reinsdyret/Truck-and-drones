@@ -8,6 +8,7 @@ pub mod genetic;
 
 use std::{fmt, fs::File, io::{BufRead, BufReader}, str::FromStr};
 
+#[derive(Clone)]
 pub struct TruckAndDroneInstance {
   pub num_customers: usize,
   pub max_flight_range: usize,
@@ -15,22 +16,12 @@ pub struct TruckAndDroneInstance {
   pub drone_travel_costs: Vec<Vec<f64>>,
 }
 
+#[derive(Clone)]
 pub struct Solution {
   pub truck_route: Vec<usize>,
   pub drone_deliveries: Vec<Vec<usize>>,
   pub drone_launch_sites: Vec<Vec<usize>>,
   pub drone_landing_sites: Vec<Vec<usize>>,
-}
-
-impl Solution {
-    pub fn clone(&self) -> Self {
-        Self {
-            truck_route: self.truck_route.clone(),
-            drone_deliveries: self.drone_deliveries.clone(),
-            drone_launch_sites: self.drone_launch_sites.clone(),
-            drone_landing_sites: self.drone_landing_sites.clone(),
-        }
-    }
 }
 
 
