@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use rand::random_range;
 
 use crate::{Solution, TruckAndDroneInstance};
-use crate::operators::Operator;
+use crate::operators::{DestroyRepair, Operator};
 
 /// Set up Ctrl+C handler, returns flag that becomes true when pressed
 pub fn setup_stop_signal() -> Arc<AtomicBool> {
@@ -674,6 +674,7 @@ pub fn run_parallel_sa_with_status(
     )));
     let total_iterations: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let improvements: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let last_global_improvement: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     
     // Per-operator statistics
     let num_ops = operators.len();
@@ -692,6 +693,7 @@ pub fn run_parallel_sa_with_status(
         let improvements_mon = improvements.clone();
         let op_uses_mon = op_uses.clone();
         let op_improvements_mon = op_improvements.clone();
+        let last_global_impr_mon = last_global_improvement.clone();
         
         s.spawn(move || {
             let mut last_best = f64::INFINITY;
@@ -708,6 +710,7 @@ pub fn run_parallel_sa_with_status(
                 let iters = total_iters_mon.load(Ordering::Relaxed);
                 let impr = improvements_mon.load(Ordering::Relaxed);
                 let current_best = global_best_mon.lock().unwrap().1;
+                let last_impr_secs = last_global_impr_mon.load(Ordering::Relaxed);
                 
                 let improved_marker = if current_best < last_best { " *** IMPROVED ***" } else { "" };
                 last_best = current_best;
@@ -738,6 +741,7 @@ pub fn run_parallel_sa_with_status(
                 println!("║  STATUS UPDATE @ {:.0}s ({:.0}s remaining)", elapsed, remaining);
                 println!("╠══════════════════════════════════════════════════╣");
                 println!("║  Global best: {:.2}{}", current_best, improved_marker);
+                println!("║  Last global improvement: {}s ago", (elapsed as u64).saturating_sub(last_impr_secs));
                 println!("║  Total iterations: {} ({:.0}/sec)", iters, iters as f64 / elapsed);
                 println!("║  Improvements found: {}", impr);
                 println!("╠──────────────────────────────────────────────────╣");
@@ -760,6 +764,8 @@ pub fn run_parallel_sa_with_status(
             let impr_counter = improvements.clone();
             let op_uses_chain = op_uses.clone();
             let op_impr_chain = op_improvements.clone();
+            let last_global_impr_chain = last_global_improvement.clone();
+            let start_time = start;
             
             s.spawn(move || {
                 run_sa_chain_with_counters(
@@ -775,6 +781,8 @@ pub fn run_parallel_sa_with_status(
                     impr_counter,
                     op_uses_chain,
                     op_impr_chain,
+                    last_global_impr_chain,
+                    start_time,
                 )
             });
         }
@@ -811,6 +819,8 @@ fn run_sa_chain_with_counters(
     improvements: Arc<std::sync::atomic::AtomicU64>,
     op_uses: Arc<Vec<std::sync::atomic::AtomicU64>>,
     op_improvements: Arc<Vec<std::sync::atomic::AtomicU64>>,
+    last_global_improvement: Arc<std::sync::atomic::AtomicU64>,
+    start_time: Instant,
 ) {
     // Initialize chain
     let (delta_avg, mut incumbent, mut best_solution, mut incumbent_score, mut best_score) =
@@ -825,6 +835,9 @@ fn run_sa_chain_with_counters(
     let mut last_sync = Instant::now();
     let mut local_iters: u64 = 0;
     let mut last_improvement = Instant::now();
+    let mut last_forced_escape = Instant::now();
+    let force_escape_after = Duration::from_secs(300);
+    let escape_destroy = DestroyRepair::new(30);
     
     // Adaptive operator selection (ALNS-style)
     let mut selector = AdaptiveOperatorSelector::new(operators.len(), 0.8);
@@ -872,6 +885,7 @@ fn run_sa_chain_with_counters(
                 global.0 = best_solution.clone();
                 global.1 = best_score;
                 improvements.fetch_add(1, Ordering::Relaxed);
+                last_global_improvement.store(start_time.elapsed().as_secs(), Ordering::Relaxed);
                 println!("[Chain {}] NEW GLOBAL BEST: {:.2}", chain_id, best_score);
             }
             
@@ -969,6 +983,27 @@ fn run_sa_chain_with_counters(
             incumbent = best_solution.clone();
             incumbent_score = best_score;
             no_improve_count = 0;
+        }
+
+        // Force escape if no global improvement for a long time
+        let last_global_secs = last_global_improvement.load(Ordering::Relaxed);
+        let elapsed_secs = start_time.elapsed().as_secs();
+        if elapsed_secs.saturating_sub(last_global_secs) >= force_escape_after.as_secs()
+            && last_forced_escape.elapsed() >= force_escape_after
+        {
+            if let Some(escaped_sol) = escape_destroy.apply(&best_solution, instance) {
+                if let Ok(result) = escaped_sol.verify_and_cost(instance) {
+                    incumbent = escaped_sol;
+                    incumbent_score = result.total_time;
+                    no_improve_count = 0;
+                    last_improvement = Instant::now();
+                    last_forced_escape = Instant::now();
+                    println!(
+                        "[Chain {}] GLOBAL STAGNATION ESCAPE: destroy={} score {:.2} -> {:.2}",
+                        chain_id, escape_destroy.num_destroy, best_score, incumbent_score
+                    );
+                }
+            }
         }
 
     }
