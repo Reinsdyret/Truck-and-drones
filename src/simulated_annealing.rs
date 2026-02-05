@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use rand::random_range;
@@ -675,11 +675,20 @@ pub fn run_parallel_sa_with_status(
     let total_iterations: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let improvements: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let last_global_improvement: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let new_solutions_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let seen_window_secs: u64 = 1000;
     
     // Per-operator statistics
     let num_ops = operators.len();
     let op_uses: Arc<Vec<AtomicU64>> = Arc::new((0..num_ops).map(|_| AtomicU64::new(0)).collect());
     let op_improvements: Arc<Vec<AtomicU64>> = Arc::new((0..num_ops).map(|_| AtomicU64::new(0)).collect());
+
+    // Shared set of seen solutions across threads
+    let seen_solutions: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+    {
+        let mut seen = seen_solutions.lock().unwrap();
+        seen.insert(init_solution.to_string(), 0);
+    }
     
     let start = Instant::now();
     let stop_flag = stop_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
@@ -694,9 +703,13 @@ pub fn run_parallel_sa_with_status(
         let op_uses_mon = op_uses.clone();
         let op_improvements_mon = op_improvements.clone();
         let last_global_impr_mon = last_global_improvement.clone();
+        let new_solutions_mon = new_solutions_total.clone();
+        let seen_solutions_mon = seen_solutions.clone();
+        let seen_window_secs_mon = seen_window_secs;
         
         s.spawn(move || {
             let mut last_best = f64::INFINITY;
+            let mut last_new_solutions_total: u64 = 0;
             
             while start.elapsed() < duration && !stop_flag_mon.load(Ordering::SeqCst) {
                 thread::sleep(status_interval);
@@ -706,11 +719,22 @@ pub fn run_parallel_sa_with_status(
                 }
                 
                 let elapsed = start.elapsed().as_secs_f64();
+                let elapsed_secs = elapsed as u64;
                 let remaining = duration.as_secs_f64() - elapsed;
                 let iters = total_iters_mon.load(Ordering::Relaxed);
                 let impr = improvements_mon.load(Ordering::Relaxed);
                 let current_best = global_best_mon.lock().unwrap().1;
                 let last_impr_secs = last_global_impr_mon.load(Ordering::Relaxed);
+                let new_total = new_solutions_mon.load(Ordering::Relaxed);
+                let new_since_last = new_total.saturating_sub(last_new_solutions_total);
+                last_new_solutions_total = new_total;
+                
+                {
+                    let mut seen = seen_solutions_mon.lock().unwrap();
+                    seen.retain(|_, last_seen| {
+                        elapsed_secs.saturating_sub(*last_seen) <= seen_window_secs_mon
+                    });
+                }
                 
                 let improved_marker = if current_best < last_best { " *** IMPROVED ***" } else { "" };
                 last_best = current_best;
@@ -744,6 +768,7 @@ pub fn run_parallel_sa_with_status(
                 println!("║  Last global improvement: {}s ago", (elapsed as u64).saturating_sub(last_impr_secs));
                 println!("║  Total iterations: {} ({:.0}/sec)", iters, iters as f64 / elapsed);
                 println!("║  Improvements found: {}", impr);
+                println!("║  New solutions since last: {}", new_since_last);
                 println!("╠──────────────────────────────────────────────────╣");
                 println!("║  Operator Stats (uses / improvements / rate):");
                 for (i, (uses, imps)) in op_stats.iter().enumerate() {
@@ -766,8 +791,11 @@ pub fn run_parallel_sa_with_status(
             let op_uses_chain = op_uses.clone();
             let op_impr_chain = op_improvements.clone();
             let last_global_impr_chain = last_global_improvement.clone();
+            let new_solutions_chain = new_solutions_total.clone();
             let start_time = start;
             let is_explorer = chain_id < explorer_count;
+            let seen_solutions = seen_solutions.clone();
+            let seen_window_secs_chain = seen_window_secs;
             
             s.spawn(move || {
                 run_sa_chain_with_counters(
@@ -786,6 +814,9 @@ pub fn run_parallel_sa_with_status(
                     last_global_impr_chain,
                     start_time,
                     is_explorer,
+                    seen_solutions,
+                    new_solutions_chain,
+                    seen_window_secs_chain,
                 )
             });
         }
@@ -825,6 +856,9 @@ fn run_sa_chain_with_counters(
     last_global_improvement: Arc<std::sync::atomic::AtomicU64>,
     start_time: Instant,
     is_explorer: bool,
+    seen_solutions: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    new_solutions_total: Arc<std::sync::atomic::AtomicU64>,
+    seen_window_secs: u64,
 ) {
     // Initialize chain
     let (delta_avg, mut incumbent, mut best_solution, mut incumbent_score, mut best_score) =
@@ -855,12 +889,6 @@ fn run_sa_chain_with_counters(
     let mut selector = AdaptiveOperatorSelector::new(operators.len(), 0.8);
     let weight_update_interval = 50_000;
     let single_op = operators.len() == 1;
-    let track_seen = operators.len() > 1;
-    let mut seen_solutions: HashSet<String> = HashSet::new();
-    if track_seen {
-        seen_solutions.insert(incumbent.to_string());
-    }
-    
     // Local counters to reduce atomic contention
     let mut local_op_uses: Vec<u64> = vec![0; operators.len()];
     let mut local_op_impr: Vec<u64> = vec![0; operators.len()];
@@ -943,19 +971,29 @@ fn run_sa_chain_with_counters(
         };
         
         let delta = new_score - incumbent_score;
-        let is_new_solution = if track_seen {
-            seen_solutions.insert(new_solution.to_string())
-        } else {
-            false
-        };
-        let mut points = 0.0;
-        if new_score < best_score {
-            let global_best_score = global_best.lock().unwrap().1;
-            if new_score < global_best_score {
-                points = 5.0;
-            } else {
-                points = 3.0;
+        let now_secs = start_time.elapsed().as_secs();
+        let is_new_solution = {
+            let mut seen = seen_solutions.lock().unwrap();
+            let key = new_solution.to_string();
+            match seen.get_mut(&key) {
+                Some(last_seen) => {
+                    let is_new = now_secs.saturating_sub(*last_seen) > seen_window_secs;
+                    *last_seen = now_secs;
+                    is_new
+                }
+                None => {
+                    seen.insert(key, now_secs);
+                    true
+                }
             }
+        };
+        if is_new_solution {
+            new_solutions_total.fetch_add(1, Ordering::Relaxed);
+        }
+        let global_best_score = global_best.lock().unwrap().1;
+        let mut points = 0.0;
+        if new_score < global_best_score {
+            points = 5.0;
         } else if new_score < incumbent_score {
             points = 3.0;
         } else if is_new_solution {

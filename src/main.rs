@@ -37,7 +37,7 @@ fn main() {
         &solution,
         &instance,
         &operators,
-        Duration::from_secs(60 * 60),
+        Duration::from_secs(60 * 60 * 10),
         worker_chains,
         Duration::from_secs(60),
         Some(stop_flag),
