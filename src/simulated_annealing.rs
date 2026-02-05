@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use rand::random_range;
@@ -37,7 +38,7 @@ impl AdaptiveOperatorSelector {
             uses: vec![0; n_operators],
             improvements: vec![0.0; n_operators],
             decay,
-            min_weight: 0.1,
+            min_weight: 0.01,
         }
     }
     
@@ -341,6 +342,7 @@ fn perturb_solution(
     instance: &TruckAndDroneInstance,
     operators: &[&(dyn Operator + Sync)],
     num_perturbations: usize,
+    stop_flag: Option<&AtomicBool>,
 ) -> (Solution, f64) {
     let mut current = solution.clone();
     let mut current_score = current.verify_and_cost(instance)
@@ -348,6 +350,12 @@ fn perturb_solution(
         .unwrap_or(f64::INFINITY);
     
     for _ in 0..num_perturbations {
+        if stop_flag
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            break;
+        }
         let op_idx = random_range(0..operators.len());
         if let Some(new_sol) = operators[op_idx].apply(&current, instance) {
             if let Ok(result) = new_sol.verify_and_cost(instance) {
@@ -507,7 +515,13 @@ pub fn run_simulated_annealing_timed(
             
             // Perturb the best solution instead of just copying it
             let num_perturbations = 5 + (reheat_count % 10);  // Vary perturbation strength
-            let (perturbed, perturbed_score) = perturb_solution(&best_solution, instance, operators, num_perturbations);
+            let (perturbed, perturbed_score) = perturb_solution(
+                &best_solution,
+                instance,
+                operators,
+                num_perturbations,
+                stop_flag.as_deref(),
+            );
             
             incumbent = perturbed;
             incumbent_score = perturbed_score;
@@ -703,6 +717,22 @@ pub fn run_parallel_sa_with_status(
                     .zip(op_improvements_mon.iter())
                     .map(|(u, i)| (u.load(Ordering::Relaxed), i.load(Ordering::Relaxed)))
                     .collect();
+                let mut op_weights: Vec<f64> = op_stats
+                    .iter()
+                    .map(|(uses, imps)| {
+                        if *uses > 0 {
+                            (*imps as f64 / *uses as f64).max(0.01)
+                        } else {
+                            0.01
+                        }
+                    })
+                    .collect();
+                let weight_sum: f64 = op_weights.iter().sum();
+                if weight_sum > 0.0 {
+                    for w in &mut op_weights {
+                        *w /= weight_sum;
+                    }
+                }
                 
                 println!("\n╔══════════════════════════════════════════════════╗");
                 println!("║  STATUS UPDATE @ {:.0}s ({:.0}s remaining)", elapsed, remaining);
@@ -716,6 +746,7 @@ pub fn run_parallel_sa_with_status(
                     let rate = if *uses > 0 { *imps as f64 / *uses as f64 * 100.0 } else { 0.0 };
                     println!("║    Op {}: {:>8} / {:>6} / {:>5.2}%", i, uses, imps, rate);
                 }
+                println!("║  Operator Weights: {:?}", op_weights);
                 println!("╚══════════════════════════════════════════════════╝\n");
             }
         });
@@ -787,16 +818,23 @@ fn run_sa_chain_with_counters(
     
     let t_zero = if delta_avg <= 0.0 { 1.0 } else { delta_avg / (-0.8f64.ln()) };
     let mut temp = t_zero;
-    let reheat_interval = 15000;
+    let reheat_interval = 1_000_000;
     let mut no_improve_count = 0;
     
     let start = Instant::now();
     let mut last_sync = Instant::now();
     let mut local_iters: u64 = 0;
+    let mut last_improvement = Instant::now();
     
     // Adaptive operator selection (ALNS-style)
     let mut selector = AdaptiveOperatorSelector::new(operators.len(), 0.8);
-    let weight_update_interval = 5000;
+    let weight_update_interval = 50_000;
+    let single_op = operators.len() == 1;
+    let track_seen = operators.len() > 1;
+    let mut seen_solutions: HashSet<String> = HashSet::new();
+    if track_seen {
+        seen_solutions.insert(incumbent.to_string());
+    }
     
     // Local counters to reduce atomic contention
     let mut local_op_uses: Vec<u64> = vec![0; operators.len()];
@@ -822,7 +860,7 @@ fn run_sa_chain_with_counters(
         }
         
         // Update adaptive weights periodically
-        if local_iters % weight_update_interval as u64 == 0 {
+        if !single_op && local_iters % weight_update_interval as u64 == 0 {
             selector.update_weights();
         }
         
@@ -849,8 +887,13 @@ fn run_sa_chain_with_counters(
         }
         
         // Adaptive operator selection (weighted by performance)
-        let op_idx = selector.select();
-        selector.record_use(op_idx);
+        if stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
+        let op_idx = if single_op { 0 } else { selector.select() };
+        if !single_op {
+            selector.record_use(op_idx);
+        }
         local_op_uses[op_idx] += 1;
         let operator = operators[op_idx];
         
@@ -861,6 +904,9 @@ fn run_sa_chain_with_counters(
                 continue;
             }
         };
+        if stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
         
         let new_score = match new_solution.verify_and_cost(instance) {
             Ok(result) => result.total_time,
@@ -871,18 +917,37 @@ fn run_sa_chain_with_counters(
         };
         
         let delta = new_score - incumbent_score;
+        let is_new_solution = if track_seen {
+            seen_solutions.insert(new_solution.to_string())
+        } else {
+            false
+        };
+        let mut points = 0.0;
+        if new_score < best_score {
+            let global_best_score = global_best.lock().unwrap().1;
+            if new_score < global_best_score {
+                points = 5.0;
+            } else {
+                points = 3.0;
+            }
+        } else if new_score < incumbent_score {
+            points = 3.0;
+        } else if is_new_solution {
+            points = 1.0;
+        }
+        if points > 0.0 {
+            local_op_impr[op_idx] += points as u64;
+            selector.record_improvement(op_idx, points);
+        }
         
         if delta < 0.0 {
-            // Track improvement for this operator (both local stats and adaptive weights)
-            local_op_impr[op_idx] += 1;
-            selector.record_improvement(op_idx, -delta);  // ALNS-style: record magnitude of improvement
-            
             incumbent = new_solution;
             incumbent_score = new_score;
             no_improve_count = 0;
             if new_score < best_score {
                 best_solution = incumbent.clone();
                 best_score = new_score;
+                last_improvement = Instant::now();
             }
         } else {
             let p = (-delta / temp).exp();
@@ -905,6 +970,7 @@ fn run_sa_chain_with_counters(
             incumbent_score = best_score;
             no_improve_count = 0;
         }
+
     }
     
     // Final sync

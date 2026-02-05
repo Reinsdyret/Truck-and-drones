@@ -1,4 +1,5 @@
 use rand::Rng;
+use std::collections::HashSet;
 use rayon::prelude::*;
 use crate::{Solution, TruckAndDroneInstance};
 
@@ -229,6 +230,69 @@ impl Operator for TwoOptTruck {
     }
 }
 
+/// 3-opt: reorder two segments of the truck route
+pub struct ThreeOptTruck;
+
+impl Operator for ThreeOptTruck {
+    fn apply(&self, solution: &Solution, _instance: &TruckAndDroneInstance) -> Option<Solution> {
+        let mut rng = rand::rng();
+        let len = solution.truck_route.len();
+        if len < 6 {
+            return None;
+        }
+
+        let max_idx = len - 2;
+        let mut i = rng.random_range(1..=max_idx);
+        let mut j = rng.random_range(1..=max_idx);
+        let mut k = rng.random_range(1..=max_idx);
+        while i == j || j == k || i == k {
+            i = rng.random_range(1..=max_idx);
+            j = rng.random_range(1..=max_idx);
+            k = rng.random_range(1..=max_idx);
+        }
+
+        let mut cuts = [i, j, k];
+        cuts.sort_unstable();
+        let (i, j, k) = (cuts[0], cuts[1], cuts[2]);
+
+        let a = &solution.truck_route[..i];
+        let b = &solution.truck_route[i..j];
+        let c = &solution.truck_route[j..k];
+        let d = &solution.truck_route[k..];
+
+        let pattern = rng.random_range(0..5);
+        let mut new_route = Vec::with_capacity(len);
+        new_route.extend_from_slice(a);
+        match pattern {
+            0 => {
+                new_route.extend(b.iter().rev().copied());
+                new_route.extend_from_slice(c);
+            }
+            1 => {
+                new_route.extend_from_slice(b);
+                new_route.extend(c.iter().rev().copied());
+            }
+            2 => {
+                new_route.extend(c.iter().rev().copied());
+                new_route.extend_from_slice(b);
+            }
+            3 => {
+                new_route.extend_from_slice(c);
+                new_route.extend(b.iter().rev().copied());
+            }
+            _ => {
+                new_route.extend(b.iter().rev().copied());
+                new_route.extend(c.iter().rev().copied());
+            }
+        }
+        new_route.extend_from_slice(d);
+
+        let mut new_sol = solution.clone();
+        new_sol.truck_route = new_route;
+        Some(new_sol)
+    }
+}
+
 /// Greedily assign truck customers to drones based on shortest flight time
 pub struct GreedyDroneAssign;
 
@@ -314,6 +378,256 @@ impl Operator for GreedyDroneAssign {
         } else {
             None
         }
+    }
+}
+
+/// Greedy assignment: remove a random non-rendezvous customer and reinsert best
+pub struct GreedyAssignment;
+
+impl Operator for GreedyAssignment {
+    fn apply(&self, solution: &Solution, instance: &TruckAndDroneInstance) -> Option<Solution> {
+        let mut rng = rand::rng();
+        let rendezvous = collect_rendezvous_customers(solution);
+        let mut candidates: Vec<usize> = solution.truck_route
+            .iter()
+            .filter(|&&c| c != 0 && !rendezvous.contains(&c))
+            .copied()
+            .collect();
+        candidates.extend(
+            solution.drone_deliveries
+                .iter()
+                .flatten()
+                .filter(|&&c| !rendezvous.contains(&c))
+                .copied(),
+        );
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let customer = candidates[rng.random_range(0..candidates.len())];
+        let (base_sol, _) = remove_customer_from_solution(solution, customer)?;
+        insert_customer_best(&base_sol, customer, instance)
+    }
+}
+
+/// General assignment: remove 2-5 non-rendezvous customers and reinsert greedily
+pub struct GeneralAssignment {
+    pub min_remove: usize,
+    pub max_remove: usize,
+}
+
+impl GeneralAssignment {
+    pub fn new(min_remove: usize, max_remove: usize) -> Self {
+        Self { min_remove, max_remove }
+    }
+}
+
+impl Operator for GeneralAssignment {
+    fn apply(&self, solution: &Solution, instance: &TruckAndDroneInstance) -> Option<Solution> {
+        let mut rng = rand::rng();
+        let rendezvous = collect_rendezvous_customers(solution);
+        let mut candidates: Vec<usize> = solution.truck_route
+            .iter()
+            .filter(|&&c| c != 0 && !rendezvous.contains(&c))
+            .copied()
+            .collect();
+        candidates.extend(
+            solution.drone_deliveries
+                .iter()
+                .flatten()
+                .filter(|&&c| !rendezvous.contains(&c))
+                .copied(),
+        );
+
+        if candidates.len() < self.min_remove {
+            return None;
+        }
+
+        let max_remove = self.max_remove.min(candidates.len());
+        let num_remove = rng.random_range(self.min_remove..=max_remove);
+
+        let mut to_remove = Vec::with_capacity(num_remove);
+        for _ in 0..num_remove {
+            let idx = rng.random_range(0..candidates.len());
+            to_remove.push(candidates.swap_remove(idx));
+        }
+
+        let mut current = solution.clone();
+        for customer in &to_remove {
+            let (next, _) = remove_customer_from_solution(&current, *customer)?;
+            current = next;
+        }
+
+        for customer in to_remove {
+            current = insert_customer_best(&current, customer, instance)?;
+        }
+
+        Some(current)
+    }
+}
+
+/// Origin-destination relocation: move a rendezvous customer and replan drones
+pub struct OriginDestinationRelocation;
+
+impl Operator for OriginDestinationRelocation {
+    fn apply(&self, solution: &Solution, instance: &TruckAndDroneInstance) -> Option<Solution> {
+        let mut rng = rand::rng();
+        let rendezvous = collect_rendezvous_customers(solution);
+        let candidates: Vec<usize> = rendezvous.into_iter().filter(|&c| c != 0).collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let customer = candidates[rng.random_range(0..candidates.len())];
+        let (mut base_sol, _) = remove_customer_from_solution(solution, customer)?;
+
+        let route_len = base_sol.truck_route.len();
+        let mut best_pos = 1;
+        let mut best_delta = f64::INFINITY;
+        for i in 1..route_len {
+            let prev = base_sol.truck_route[i - 1];
+            let next = base_sol.truck_route[i];
+            let delta = instance.truck_travel_costs[prev][customer]
+                + instance.truck_travel_costs[customer][next]
+                - instance.truck_travel_costs[prev][next];
+            if delta < best_delta {
+                best_delta = delta;
+                best_pos = i;
+            }
+        }
+
+        base_sol.truck_route.insert(best_pos, customer);
+        for d in 0..base_sol.drone_deliveries.len() {
+            for i in 0..base_sol.drone_launch_sites[d].len() {
+                if base_sol.drone_launch_sites[d][i] >= best_pos {
+                    base_sol.drone_launch_sites[d][i] += 1;
+                }
+                if base_sol.drone_landing_sites[d][i] >= best_pos {
+                    base_sol.drone_landing_sites[d][i] += 1;
+                }
+            }
+        }
+
+        plan_drone_trips(&base_sol, instance)
+    }
+}
+
+/// Drone planner: replan launch/land indices for existing drone deliveries
+pub struct DronePlanner;
+
+impl Operator for DronePlanner {
+    fn apply(&self, solution: &Solution, instance: &TruckAndDroneInstance) -> Option<Solution> {
+        plan_drone_trips(solution, instance)
+    }
+}
+
+/// Wild change: randomly reinsert 2-5 customers, then repair
+pub struct WildChange {
+    pub min_changes: usize,
+    pub max_changes: usize,
+}
+
+impl WildChange {
+    pub fn new(min_changes: usize, max_changes: usize) -> Self {
+        Self { min_changes, max_changes }
+    }
+}
+
+impl Operator for WildChange {
+    fn apply(&self, solution: &Solution, instance: &TruckAndDroneInstance) -> Option<Solution> {
+        let mut rng = rand::rng();
+        let mut all_customers: Vec<usize> = solution.truck_route
+            .iter()
+            .filter(|&&c| c != 0)
+            .copied()
+            .collect();
+        all_customers.extend(solution.drone_deliveries.iter().flatten().copied());
+
+        if all_customers.is_empty() {
+            return None;
+        }
+
+        let max_changes = self.max_changes.min(all_customers.len());
+        let num_changes = rng.random_range(self.min_changes..=max_changes);
+
+        let mut to_change = Vec::with_capacity(num_changes);
+        for _ in 0..num_changes {
+            let idx = rng.random_range(0..all_customers.len());
+            to_change.push(all_customers.swap_remove(idx));
+        }
+
+        let mut current = solution.clone();
+        for customer in &to_change {
+            let (next, _) = remove_customer_from_solution(&current, *customer)?;
+            current = next;
+        }
+
+        for customer in to_change {
+            let mut inserted = false;
+            let attempts = 20;
+            for _ in 0..attempts {
+                if rng.random::<f64>() < 0.5 {
+                    // Try random truck insertion
+                    let pos = rng.random_range(1..current.truck_route.len());
+                    let mut candidate = current.clone();
+                    candidate.truck_route.insert(pos, customer);
+                    for d in 0..candidate.drone_deliveries.len() {
+                        for i in 0..candidate.drone_launch_sites[d].len() {
+                            if candidate.drone_launch_sites[d][i] >= pos {
+                                candidate.drone_launch_sites[d][i] += 1;
+                            }
+                            if candidate.drone_landing_sites[d][i] >= pos {
+                                candidate.drone_landing_sites[d][i] += 1;
+                            }
+                        }
+                    }
+                    if candidate.verify_and_cost(instance).is_ok() {
+                        current = candidate;
+                        inserted = true;
+                        break;
+                    }
+                } else {
+                    // Try random drone insertion
+                    let route_len = current.truck_route.len();
+                    if route_len < 2 {
+                        continue;
+                    }
+                    let launch = rng.random_range(0..route_len - 1);
+                    let land = rng.random_range(launch + 1..route_len);
+                    let launch_node = current.truck_route[launch];
+                    let land_node = current.truck_route[land];
+                    let flight = instance.drone_travel_costs[launch_node][customer]
+                        + instance.drone_travel_costs[customer][land_node];
+                    if flight > instance.max_flight_range as f64 {
+                        continue;
+                    }
+                    let drone_idx = rng.random_range(0..current.drone_deliveries.len());
+                    if !can_insert_drone_trip_fast(&current, drone_idx, launch, land) {
+                        continue;
+                    }
+                    let insert_idx = current.drone_launch_sites[drone_idx]
+                        .iter()
+                        .position(|&l| l > launch)
+                        .unwrap_or(current.drone_deliveries[drone_idx].len());
+                    let mut candidate = current.clone();
+                    candidate.drone_deliveries[drone_idx].insert(insert_idx, customer);
+                    candidate.drone_launch_sites[drone_idx].insert(insert_idx, launch);
+                    candidate.drone_landing_sites[drone_idx].insert(insert_idx, land);
+                    if candidate.verify_and_cost(instance).is_ok() {
+                        current = candidate;
+                        inserted = true;
+                        break;
+                    }
+                }
+            }
+
+            if !inserted {
+                current = insert_customer_best(&current, customer, instance)?;
+            }
+        }
+
+        Some(current)
     }
 }
 
@@ -513,6 +827,167 @@ fn can_insert_drone_trip_fast(solution: &Solution, drone: usize, launch: usize, 
     // Check constraints
     (insert_idx == 0 || launch >= landings[insert_idx - 1]) &&
     (insert_idx >= launches.len() || launches[insert_idx] >= land)
+}
+
+fn collect_rendezvous_customers(solution: &Solution) -> HashSet<usize> {
+    let mut rendezvous = HashSet::new();
+    for d in 0..solution.drone_launch_sites.len() {
+        for &pos in solution.drone_launch_sites[d].iter().chain(solution.drone_landing_sites[d].iter()) {
+            if pos < solution.truck_route.len() {
+                rendezvous.insert(solution.truck_route[pos]);
+            }
+        }
+    }
+    rendezvous
+}
+
+fn remove_customer_from_solution(
+    solution: &Solution,
+    customer: usize,
+) -> Option<(Solution, Option<usize>)> {
+    let mut new_sol = solution.clone();
+    if let Some(pos) = new_sol.truck_route.iter().position(|&c| c == customer) {
+        new_sol.truck_route.remove(pos);
+        for d in 0..new_sol.drone_deliveries.len() {
+            for i in 0..new_sol.drone_launch_sites[d].len() {
+                if new_sol.drone_launch_sites[d][i] > pos {
+                    new_sol.drone_launch_sites[d][i] -= 1;
+                }
+                if new_sol.drone_landing_sites[d][i] > pos {
+                    new_sol.drone_landing_sites[d][i] -= 1;
+                }
+            }
+        }
+        return Some((new_sol, Some(pos)));
+    }
+
+    for d in 0..new_sol.drone_deliveries.len() {
+        if let Some(idx) = new_sol.drone_deliveries[d].iter().position(|&c| c == customer) {
+            new_sol.drone_deliveries[d].remove(idx);
+            new_sol.drone_launch_sites[d].remove(idx);
+            new_sol.drone_landing_sites[d].remove(idx);
+            return Some((new_sol, None));
+        }
+    }
+
+    None
+}
+
+fn insert_customer_best(
+    base_sol: &Solution,
+    customer: usize,
+    instance: &TruckAndDroneInstance,
+) -> Option<Solution> {
+    let route_len = base_sol.truck_route.len();
+    let max_range = instance.max_flight_range as f64;
+    let mut candidates: Vec<(bool, f64, usize, usize, usize, usize)> = Vec::new();
+
+    for i in 1..route_len {
+        let prev = base_sol.truck_route[i - 1];
+        let next = base_sol.truck_route[i];
+        let delta = instance.truck_travel_costs[prev][customer]
+            + instance.truck_travel_costs[customer][next]
+            - instance.truck_travel_costs[prev][next];
+        candidates.push((true, delta, i, 0, 0, 0));
+    }
+
+    for launch in 0..route_len.saturating_sub(1) {
+        let launch_node = base_sol.truck_route[launch];
+        let dist_to_cust = instance.drone_travel_costs[launch_node][customer];
+        if dist_to_cust > max_range {
+            continue;
+        }
+        for land in (launch + 1)..route_len {
+            let land_node = base_sol.truck_route[land];
+            let flight = dist_to_cust + instance.drone_travel_costs[customer][land_node];
+            if flight > max_range {
+                continue;
+            }
+            for d in 0..base_sol.drone_deliveries.len() {
+                if can_insert_drone_trip_fast(base_sol, d, launch, land) {
+                    let insert_idx = base_sol.drone_launch_sites[d]
+                        .iter()
+                        .position(|&l| l > launch)
+                        .unwrap_or(base_sol.drone_deliveries[d].len());
+                    candidates.push((false, flight, d, insert_idx, launch, land));
+                    break;
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    for (is_truck, _score, pos_or_drone, insert_idx, launch, land) in candidates {
+        let mut candidate = base_sol.clone();
+        if is_truck {
+            let insert_pos = pos_or_drone;
+            candidate.truck_route.insert(insert_pos, customer);
+            for d in 0..candidate.drone_deliveries.len() {
+                for i in 0..candidate.drone_launch_sites[d].len() {
+                    if candidate.drone_launch_sites[d][i] >= insert_pos {
+                        candidate.drone_launch_sites[d][i] += 1;
+                    }
+                    if candidate.drone_landing_sites[d][i] >= insert_pos {
+                        candidate.drone_landing_sites[d][i] += 1;
+                    }
+                }
+            }
+        } else {
+            let drone_idx = pos_or_drone;
+            candidate.drone_deliveries[drone_idx].insert(insert_idx, customer);
+            candidate.drone_launch_sites[drone_idx].insert(insert_idx, launch);
+            candidate.drone_landing_sites[drone_idx].insert(insert_idx, land);
+        }
+        if candidate.verify_and_cost(instance).is_ok() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn plan_drone_trips(solution: &Solution, instance: &TruckAndDroneInstance) -> Option<Solution> {
+    let mut new_sol = solution.clone();
+    let route_len = new_sol.truck_route.len();
+    let max_range = instance.max_flight_range as f64;
+
+    for d in 0..new_sol.drone_deliveries.len() {
+        let deliveries = new_sol.drone_deliveries[d].clone();
+        new_sol.drone_launch_sites[d].clear();
+        new_sol.drone_landing_sites[d].clear();
+
+        let mut prev_land = 0;
+        for customer in deliveries {
+            let mut best_pair: Option<(usize, usize, f64)> = None;
+            for launch in prev_land..route_len.saturating_sub(1) {
+                let launch_node = new_sol.truck_route[launch];
+                let dist_out = instance.drone_travel_costs[launch_node][customer];
+                if dist_out > max_range {
+                    continue;
+                }
+                for land in (launch + 1)..route_len {
+                    let land_node = new_sol.truck_route[land];
+                    let flight = dist_out + instance.drone_travel_costs[customer][land_node];
+                    if flight > max_range {
+                        continue;
+                    }
+                    if best_pair.is_none() || flight < best_pair.unwrap().2 {
+                        best_pair = Some((launch, land, flight));
+                    }
+                }
+            }
+            let (launch, land, _) = best_pair?;
+            new_sol.drone_launch_sites[d].push(launch);
+            new_sol.drone_landing_sites[d].push(land);
+            prev_land = land;
+        }
+    }
+
+    if new_sol.verify_and_cost(instance).is_ok() {
+        Some(new_sol)
+    } else {
+        None
+    }
 }
 
 /// Smarter greedy reinsert: evaluates actual cost for top candidates
