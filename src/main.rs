@@ -10,8 +10,8 @@ fn main() {
     let instance = parse_file(file);
     println!("Loaded instance with {} customers", instance.num_customers);
 
-    // let solution = Solution::trivial(instance.num_customers, 2);
-    let solution = Solution::best_til_now();
+    let solution = Solution::trivial(instance.num_customers, 2);
+    // let solution = Solution::best_til_now();
     println!("Initial cost: {:.2}", solution.cost(&instance).unwrap());
 
     let smart_op = GreedyReinsertSmart::new(15);

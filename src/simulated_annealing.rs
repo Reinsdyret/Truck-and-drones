@@ -756,6 +756,7 @@ pub fn run_parallel_sa_with_status(
         });
         
         // Spawn worker chains
+        let explorer_count = ((num_chains as f64) * 0.30).ceil() as usize;
         for chain_id in 0..num_chains {
             let global_best = global_best.clone();
             let stop_flag = stop_flag.clone();
@@ -766,6 +767,7 @@ pub fn run_parallel_sa_with_status(
             let op_impr_chain = op_improvements.clone();
             let last_global_impr_chain = last_global_improvement.clone();
             let start_time = start;
+            let is_explorer = chain_id < explorer_count;
             
             s.spawn(move || {
                 run_sa_chain_with_counters(
@@ -783,6 +785,7 @@ pub fn run_parallel_sa_with_status(
                     op_impr_chain,
                     last_global_impr_chain,
                     start_time,
+                    is_explorer,
                 )
             });
         }
@@ -821,6 +824,7 @@ fn run_sa_chain_with_counters(
     op_improvements: Arc<Vec<std::sync::atomic::AtomicU64>>,
     last_global_improvement: Arc<std::sync::atomic::AtomicU64>,
     start_time: Instant,
+    is_explorer: bool,
 ) {
     // Initialize chain
     let (delta_avg, mut incumbent, mut best_solution, mut incumbent_score, mut best_score) =
@@ -836,8 +840,16 @@ fn run_sa_chain_with_counters(
     let mut local_iters: u64 = 0;
     let mut last_improvement = Instant::now();
     let mut last_forced_escape = Instant::now();
-    let force_escape_after = Duration::from_secs(300);
-    let escape_destroy = DestroyRepair::new(30);
+    let force_escape_after = if is_explorer {
+        Duration::from_secs(180)
+    } else {
+        Duration::from_secs(300)
+    };
+    let escape_destroy = if is_explorer {
+        DestroyRepair::new(40)
+    } else {
+        DestroyRepair::new(30)
+    };
     
     // Adaptive operator selection (ALNS-style)
     let mut selector = AdaptiveOperatorSelector::new(operators.len(), 0.8);
@@ -878,7 +890,7 @@ fn run_sa_chain_with_counters(
         }
         
         // Periodic sync with global best
-        if last_sync.elapsed() >= sync_interval {
+        if !is_explorer && last_sync.elapsed() >= sync_interval {
             let mut global = global_best.lock().unwrap();
             
             if best_score < global.1 {
