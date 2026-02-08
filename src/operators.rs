@@ -1479,7 +1479,7 @@ impl Operator for DestroyRepair {
         
         // Reinsert customers one by one using weighted random from top candidates
         let max_range = instance.max_flight_range as f64;
-        const TOP_K: usize = 10;  // Consider top 10 candidates per customer
+        const TOP_K: usize = 20;  // Consider top 20 candidates per customer
         
         for customer in to_remove {
             let route_len = new_sol.truck_route.len();
@@ -1547,20 +1547,8 @@ impl Operator for DestroyRepair {
             candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
             candidates.truncate(TOP_K);
             
-            // Weighted random: rank 1 gets weight N, rank 2 gets N-1, etc.
-            let n = candidates.len();
-            let total_weight: usize = (1..=n).sum();
-            let mut r = rng.random_range(0..total_weight);
-            
-            let mut chosen_idx = 0;
-            for (i, _) in candidates.iter().enumerate() {
-                let weight = n - i;
-                if r < weight {
-                    chosen_idx = i;
-                    break;
-                }
-                r -= weight;
-            }
+            // Uniform random from top K candidates — maximizes diversity
+            let chosen_idx = rng.random_range(0..candidates.len());
             
             let (is_truck, _, pos_or_drone, insert_idx, launch, land) = candidates[chosen_idx];
             

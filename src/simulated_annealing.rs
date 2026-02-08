@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
-use std::collections::HashMap;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use rand::random_range;
@@ -381,18 +381,25 @@ pub fn run_simulated_annealing_timed(
         estimate_avg_delta(init_solution, instance, operators, 0.8);
 
     // Calculate initial temperature from average delta
-    let t_zero = if delta_avg <= 0.0 {
-        1.0
-    } else {
-        delta_avg / (-0.8f64.ln())
-    };
+    // Force a minimum temperature based on the solution cost so SA can actually explore
+    let calibrated_t = if delta_avg <= 0.0 { 1.0 } else { delta_avg / (-0.8f64.ln()) };
+    let cost_based_t = best_score * 0.02; // 2% of cost as minimum temp
+    let t_zero = calibrated_t.max(cost_based_t);
     
     let mut temp = t_zero;
-    let reheat_interval = 15000;  // Iterations without improvement before reheat
+    let reheat_interval = 10000;  // Iterations without improvement before reheat
     let weight_update_interval = 5000;  // Update adaptive weights periodically
     let mut no_improve_count = 0;
     let mut reheat_count = 0;
     let mut stopped_early = false;
+    let mut last_best_improvement = Instant::now();
+
+    // Large destroy-repair operators for escape
+    let escape_ops = [
+        DestroyRepair::new(12),
+        DestroyRepair::new(20),
+        DestroyRepair::new(30),
+    ];
 
     // Adaptive operator selection
     let mut selector = AdaptiveOperatorSelector::new(operators.len(), 0.8);
@@ -411,9 +418,10 @@ pub fn run_simulated_annealing_timed(
     let mut i: u64 = 0;
     let mut last_print = Instant::now();
 
-    println!("Starting timed SA (adaptive + perturbation) for {:?}", duration);
+    println!("Starting timed SA (aggressive escape) for {:?}", duration);
     println!("Press Ctrl+C to stop early and get current best solution");
-    println!("Initial temp: {:.4}, best: {:.2}", t_zero, best_score);
+    println!("Calibrated temp: {:.4}, cost-based temp: {:.4}, using t_zero: {:.4}, best: {:.2}", 
+        calibrated_t, cost_based_t, t_zero, best_score);
 
     // Check both time and stop flag
     let should_stop = || {
@@ -475,6 +483,7 @@ pub fn run_simulated_annealing_timed(
             if new_score < best_score {
                 best_solution = incumbent.clone();
                 best_score = new_score;
+                last_best_improvement = Instant::now();
                 println!(
                     "[{:.0}s] NEW BEST: {:.2} (iter {}, op {})",
                     start.elapsed().as_secs_f64(), best_score, i, op_idx
@@ -501,36 +510,55 @@ pub fn run_simulated_annealing_timed(
             selector.update_weights();
         }
 
-        // Reheat with perturbation if stuck
+        // Reheat + escape if stuck
         if no_improve_count >= reheat_interval {
             reheat_count += 1;
             
-            // Alternate between different reheat strategies
-            let reheat_temp = match reheat_count % 3 {
-                0 => t_zero * 0.7,  // High reheat
-                1 => t_zero * 0.5,  // Medium reheat  
-                _ => t_zero * 0.3,  // Low reheat
-            };
-            temp = reheat_temp;
+            // Always reheat to full t_zero — we need to explore, not exploit
+            temp = t_zero;
             
-            // Perturb the best solution instead of just copying it
-            let num_perturbations = 5 + (reheat_count % 10);  // Vary perturbation strength
-            let (perturbed, perturbed_score) = perturb_solution(
-                &best_solution,
-                instance,
-                operators,
-                num_perturbations,
-                stop_flag.as_deref(),
-            );
+            // Use a large destroy-repair on the BEST solution to escape the basin
+            let esc_idx = (reheat_count as usize) % escape_ops.len();
+            let escape_op = &escape_ops[esc_idx];
             
-            incumbent = perturbed;
-            incumbent_score = perturbed_score;
+            if let Some(escaped) = escape_op.apply(&best_solution, instance) {
+                if let Ok(result) = escaped.verify_and_cost(instance) {
+                    incumbent = escaped;
+                    incumbent_score = result.total_time;
+                    println!(
+                        "[{:.0}s] ESCAPE #{} at iter {}: destroy={}, temp={:.2}, score {:.2} -> {:.2}",
+                        start.elapsed().as_secs_f64(), reheat_count, i, 
+                        escape_op.num_destroy, temp, best_score, incumbent_score
+                    );
+                } else {
+                    // Fallback: just restart from best
+                    incumbent = best_solution.clone();
+                    incumbent_score = best_score;
+                }
+            } else {
+                incumbent = best_solution.clone();
+                incumbent_score = best_score;
+            }
+            
             no_improve_count = 0;
-            
-            println!(
-                "[{:.0}s] REHEAT #{} at iter {}: temp={:.4}, perturbed with {} moves, score {:.2} -> {:.2}",
-                start.elapsed().as_secs_f64(), reheat_count, i, reheat_temp, num_perturbations, best_score, incumbent_score
-            );
+        }
+        
+        // Mega escape: if no new best for 120 seconds, do a very large destruction
+        if last_best_improvement.elapsed() >= Duration::from_secs(120) {
+            let mega_destroy = DestroyRepair::new(40);
+            if let Some(escaped) = mega_destroy.apply(&best_solution, instance) {
+                if let Ok(result) = escaped.verify_and_cost(instance) {
+                    incumbent = escaped;
+                    incumbent_score = result.total_time;
+                    temp = t_zero * 1.5; // Even higher temp after mega escape
+                    no_improve_count = 0;
+                    println!(
+                        "[{:.0}s] MEGA ESCAPE at iter {}: destroy=40, score {:.2} -> {:.2}",
+                        start.elapsed().as_secs_f64(), i, best_score, incumbent_score
+                    );
+                }
+            }
+            last_best_improvement = Instant::now();
         }
 
         // Log every 1000 iterations
@@ -644,7 +672,30 @@ pub fn run_parallel_sa(
     )
 }
 
-/// Parallel SA with configurable status update interval
+/// Parallel SA starting from multiple diverse solutions.
+/// Chains are assigned round-robin across the provided starting solutions.
+pub fn run_parallel_sa_multi_start(
+    starting_solutions: &[Solution],
+    instance: &TruckAndDroneInstance,
+    operators: &[&(dyn Operator + Sync)],
+    duration: Duration,
+    num_chains: usize,
+    sync_interval: Duration,
+    stop_flag: Option<Arc<AtomicBool>>,
+) -> Solution {
+    run_parallel_sa_multi_start_with_status(
+        starting_solutions,
+        instance,
+        operators,
+        duration,
+        num_chains,
+        sync_interval,
+        Duration::from_secs(100),
+        stop_flag,
+    )
+}
+
+/// Parallel SA with configurable status update interval (uses rayon)
 pub fn run_parallel_sa_with_status(
     init_solution: &Solution,
     instance: &TruckAndDroneInstance,
@@ -657,10 +708,16 @@ pub fn run_parallel_sa_with_status(
 ) -> Solution {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
-    use std::thread;
+    use rayon::prelude::*;
+    
+    // Configure rayon thread pool for the worker chains
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_chains)
+        .build_global()
+        .ok();
     
     println!("===========================================");
-    println!("  Parallel SA: {} worker chains", num_chains);
+    println!("  Parallel SA (rayon): {} worker chains", num_chains);
     println!("  Sync interval: {:?}", sync_interval);
     println!("  Status updates: every {:?}", status_interval);
     println!("  Total duration: {:?}", duration);
@@ -675,152 +732,113 @@ pub fn run_parallel_sa_with_status(
     let total_iterations: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let improvements: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let last_global_improvement: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let new_solutions_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let seen_window_secs: u64 = 1000;
     
     // Per-operator statistics
     let num_ops = operators.len();
     let op_uses: Arc<Vec<AtomicU64>> = Arc::new((0..num_ops).map(|_| AtomicU64::new(0)).collect());
     let op_improvements: Arc<Vec<AtomicU64>> = Arc::new((0..num_ops).map(|_| AtomicU64::new(0)).collect());
-
-    // Shared set of seen solutions across threads
-    let seen_solutions: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
-    {
-        let mut seen = seen_solutions.lock().unwrap();
-        seen.insert(init_solution.to_string(), 0);
-    }
     
     let start = Instant::now();
     let stop_flag = stop_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     
-    // Use scoped threads
-    thread::scope(|s| {
-        // Spawn monitoring thread
-        let global_best_mon = global_best.clone();
-        let stop_flag_mon = stop_flag.clone();
-        let total_iters_mon = total_iterations.clone();
-        let improvements_mon = improvements.clone();
-        let op_uses_mon = op_uses.clone();
-        let op_improvements_mon = op_improvements.clone();
-        let last_global_impr_mon = last_global_improvement.clone();
-        let new_solutions_mon = new_solutions_total.clone();
-        let seen_solutions_mon = seen_solutions.clone();
-        let seen_window_secs_mon = seen_window_secs;
+    // Spawn monitor thread via std::thread (just sleeps + prints)
+    let global_best_mon = global_best.clone();
+    let stop_flag_mon = stop_flag.clone();
+    let total_iters_mon = total_iterations.clone();
+    let improvements_mon = improvements.clone();
+    let op_uses_mon = op_uses.clone();
+    let op_improvements_mon = op_improvements.clone();
+    let last_global_impr_mon = last_global_improvement.clone();
+    
+    let monitor = std::thread::spawn(move || {
+        let mut last_best = f64::INFINITY;
         
-        s.spawn(move || {
-            let mut last_best = f64::INFINITY;
-            let mut last_new_solutions_total: u64 = 0;
+        while start.elapsed() < duration && !stop_flag_mon.load(Ordering::SeqCst) {
+            std::thread::sleep(status_interval);
             
-            while start.elapsed() < duration && !stop_flag_mon.load(Ordering::SeqCst) {
-                thread::sleep(status_interval);
-                
-                if stop_flag_mon.load(Ordering::SeqCst) {
-                    break;
-                }
-                
-                let elapsed = start.elapsed().as_secs_f64();
-                let elapsed_secs = elapsed as u64;
-                let remaining = duration.as_secs_f64() - elapsed;
-                let iters = total_iters_mon.load(Ordering::Relaxed);
-                let impr = improvements_mon.load(Ordering::Relaxed);
-                let current_best = global_best_mon.lock().unwrap().1;
-                let last_impr_secs = last_global_impr_mon.load(Ordering::Relaxed);
-                let new_total = new_solutions_mon.load(Ordering::Relaxed);
-                let new_since_last = new_total.saturating_sub(last_new_solutions_total);
-                last_new_solutions_total = new_total;
-                
-                {
-                    let mut seen = seen_solutions_mon.lock().unwrap();
-                    seen.retain(|_, last_seen| {
-                        elapsed_secs.saturating_sub(*last_seen) <= seen_window_secs_mon
-                    });
-                }
-                
-                let improved_marker = if current_best < last_best { " *** IMPROVED ***" } else { "" };
-                last_best = current_best;
-                
-                // Collect operator stats
-                let op_stats: Vec<(u64, u64)> = op_uses_mon.iter()
-                    .zip(op_improvements_mon.iter())
-                    .map(|(u, i)| (u.load(Ordering::Relaxed), i.load(Ordering::Relaxed)))
-                    .collect();
-                let mut op_weights: Vec<f64> = op_stats
-                    .iter()
-                    .map(|(uses, imps)| {
-                        if *uses > 0 {
-                            (*imps as f64 / *uses as f64).max(0.01)
-                        } else {
-                            0.01
-                        }
-                    })
-                    .collect();
-                let weight_sum: f64 = op_weights.iter().sum();
-                if weight_sum > 0.0 {
-                    for w in &mut op_weights {
-                        *w /= weight_sum;
-                    }
-                }
-                
-                println!("\n╔══════════════════════════════════════════════════╗");
-                println!("║  STATUS UPDATE @ {:.0}s ({:.0}s remaining)", elapsed, remaining);
-                println!("╠══════════════════════════════════════════════════╣");
-                println!("║  Global best: {:.2}{}", current_best, improved_marker);
-                println!("║  Last global improvement: {}s ago", (elapsed as u64).saturating_sub(last_impr_secs));
-                println!("║  Total iterations: {} ({:.0}/sec)", iters, iters as f64 / elapsed);
-                println!("║  Improvements found: {}", impr);
-                println!("║  New solutions since last: {}", new_since_last);
-                println!("╠──────────────────────────────────────────────────╣");
-                println!("║  Operator Stats (uses / improvements / rate):");
-                for (i, (uses, imps)) in op_stats.iter().enumerate() {
-                    let rate = if *uses > 0 { *imps as f64 / *uses as f64 * 100.0 } else { 0.0 };
-                    println!("║    Op {}: {:>8} / {:>6} / {:>5.2}%", i, uses, imps, rate);
-                }
-                println!("║  Operator Weights: {:?}", op_weights);
-                println!("╚══════════════════════════════════════════════════╝\n");
+            if stop_flag_mon.load(Ordering::SeqCst) {
+                break;
             }
-        });
-        
-        // Spawn worker chains
-        let explorer_count = ((num_chains as f64) * 0.30).ceil() as usize;
-        for chain_id in 0..num_chains {
-            let global_best = global_best.clone();
-            let stop_flag = stop_flag.clone();
-            let init_sol = init_solution.clone();
-            let total_iters = total_iterations.clone();
-            let impr_counter = improvements.clone();
-            let op_uses_chain = op_uses.clone();
-            let op_impr_chain = op_improvements.clone();
-            let last_global_impr_chain = last_global_improvement.clone();
-            let new_solutions_chain = new_solutions_total.clone();
-            let start_time = start;
-            let is_explorer = chain_id < explorer_count;
-            let seen_solutions = seen_solutions.clone();
-            let seen_window_secs_chain = seen_window_secs;
             
-            s.spawn(move || {
-                run_sa_chain_with_counters(
-                    chain_id,
-                    &init_sol,
-                    instance,
-                    operators,
-                    duration,
-                    sync_interval,
-                    global_best,
-                    stop_flag,
-                    total_iters,
-                    impr_counter,
-                    op_uses_chain,
-                    op_impr_chain,
-                    last_global_impr_chain,
-                    start_time,
-                    is_explorer,
-                    seen_solutions,
-                    new_solutions_chain,
-                    seen_window_secs_chain,
-                )
-            });
+            let elapsed = start.elapsed().as_secs_f64();
+            let remaining = duration.as_secs_f64() - elapsed;
+            let iters = total_iters_mon.load(Ordering::Relaxed);
+            let impr = improvements_mon.load(Ordering::Relaxed);
+            let global_guard = global_best_mon.lock().unwrap();
+            let current_best = global_guard.1;
+            let current_best_sol = global_guard.0.to_string();
+            drop(global_guard);
+            let last_impr_secs = last_global_impr_mon.load(Ordering::Relaxed);
+            
+            let improved_marker = if current_best < last_best { " *** IMPROVED ***" } else { "" };
+            last_best = current_best;
+            
+            let op_stats: Vec<(u64, u64)> = op_uses_mon.iter()
+                .zip(op_improvements_mon.iter())
+                .map(|(u, i)| (u.load(Ordering::Relaxed), i.load(Ordering::Relaxed)))
+                .collect();
+            let mut op_weights: Vec<f64> = op_stats
+                .iter()
+                .map(|(uses, imps)| {
+                    if *uses > 0 {
+                        (*imps as f64 / *uses as f64).max(0.01)
+                    } else {
+                        0.01
+                    }
+                })
+                .collect();
+            let weight_sum: f64 = op_weights.iter().sum();
+            if weight_sum > 0.0 {
+                for w in &mut op_weights {
+                    *w /= weight_sum;
+                }
+            }
+            
+            println!("\n╔══════════════════════════════════════════════════╗");
+            println!("║  STATUS UPDATE @ {:.0}s ({:.0}s remaining)", elapsed, remaining);
+            println!("╠══════════════════════════════════════════════════╣");
+            println!("║  Global best: {:.2}{}", current_best, improved_marker);
+            println!("║  Last global improvement: {}s ago", (elapsed as u64).saturating_sub(last_impr_secs));
+            println!("║  Total iterations: {} ({:.0}/sec)", iters, iters as f64 / elapsed);
+            println!("║  Improvements found: {}", impr);
+            println!("╠──────────────────────────────────────────────────╣");
+            println!("║  Operator Stats (uses / improvements / rate):");
+            for (i, (uses, imps)) in op_stats.iter().enumerate() {
+                let rate = if *uses > 0 { *imps as f64 / *uses as f64 * 100.0 } else { 0.0 };
+                println!("║    Op {}: {:>8} / {:>6} / {:>5.2}%", i, uses, imps, rate);
+            }
+            println!("║  Operator Weights: {:?}", op_weights);
+            println!("╠──────────────────────────────────────────────────╣");
+            println!("║  Best solution:");
+            println!("║  {}", current_best_sol);
+            println!("╚══════════════════════════════════════════════════╝\n");
         }
     });
+    
+    // Run all SA chains in parallel via rayon
+    let explorer_count = ((num_chains as f64) * 0.30).ceil() as usize;
+    (0..num_chains).into_par_iter().for_each(|chain_id| {
+        run_sa_chain_with_counters(
+            chain_id,
+            init_solution,
+            instance,
+            operators,
+            duration,
+            sync_interval,
+            global_best.clone(),
+            stop_flag.clone(),
+            total_iterations.clone(),
+            improvements.clone(),
+            op_uses.clone(),
+            op_improvements.clone(),
+            last_global_improvement.clone(),
+            start,
+            chain_id < explorer_count,
+        );
+    });
+    
+    // Wait for monitor to finish
+    let _ = monitor.join();
     
     let (best_sol, best_score) = global_best.lock().unwrap().clone();
     let total_iters = total_iterations.load(Ordering::Relaxed);
@@ -828,6 +846,182 @@ pub fn run_parallel_sa_with_status(
     
     println!("\n╔══════════════════════════════════════════╗");
     println!("║        PARALLEL SA COMPLETE              ║");
+    println!("╠══════════════════════════════════════════╣");
+    println!("║  Total time: {:.1}s", start.elapsed().as_secs_f64());
+    println!("║  Total iterations: {}", total_iters);
+    println!("║  Iterations/sec: {:.0}", total_iters as f64 / start.elapsed().as_secs_f64());
+    println!("║  Total improvements: {}", total_impr);
+    println!("║  FINAL BEST: {:.2}", best_score);
+    println!("╚══════════════════════════════════════════╝");
+    
+    best_sol
+}
+
+/// Parallel SA with multiple starting solutions (uses rayon)
+/// Chains are distributed round-robin across the starting solutions.
+pub fn run_parallel_sa_multi_start_with_status(
+    starting_solutions: &[Solution],
+    instance: &TruckAndDroneInstance,
+    operators: &[&(dyn Operator + Sync)],
+    duration: Duration,
+    num_chains: usize,
+    sync_interval: Duration,
+    status_interval: Duration,
+    stop_flag: Option<Arc<AtomicBool>>,
+) -> Solution {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use rayon::prelude::*;
+
+    assert!(!starting_solutions.is_empty(), "Need at least one starting solution");
+    
+    // Configure rayon thread pool for the worker chains
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_chains)
+        .build_global()
+        .ok();
+    
+    // Find the best starting solution for global best initialization
+    let mut best_init_sol = starting_solutions[0].clone();
+    let mut best_init_cost = best_init_sol.verify_and_cost(instance).map(|r| r.total_time).unwrap_or(f64::INFINITY);
+    
+    println!("===========================================");
+    println!("  Parallel SA Multi-Start (rayon): {} chains", num_chains);
+    println!("  Starting solutions: {}", starting_solutions.len());
+    for (i, sol) in starting_solutions.iter().enumerate() {
+        let cost = sol.verify_and_cost(instance).map(|r| r.total_time).unwrap_or(f64::INFINITY);
+        println!("    Solution {}: {:.2}", i, cost);
+        if cost < best_init_cost {
+            best_init_sol = sol.clone();
+            best_init_cost = cost;
+        }
+    }
+    println!("  Best starting: {:.2}", best_init_cost);
+    println!("  Sync interval: {:?}", sync_interval);
+    println!("  Status updates: every {:?}", status_interval);
+    println!("  Total duration: {:?}", duration);
+    println!("  Press Ctrl+C to stop early");
+    println!("===========================================\n");
+    
+    // Shared state - initialize global best with the best starting solution
+    let global_best: Arc<Mutex<(Solution, f64)>> = Arc::new(Mutex::new((
+        best_init_sol.clone(),
+        best_init_cost,
+    )));
+    let total_iterations: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let improvements: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let last_global_improvement: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    
+    let num_ops = operators.len();
+    let op_uses: Arc<Vec<AtomicU64>> = Arc::new((0..num_ops).map(|_| AtomicU64::new(0)).collect());
+    let op_improvements: Arc<Vec<AtomicU64>> = Arc::new((0..num_ops).map(|_| AtomicU64::new(0)).collect());
+
+    let start = Instant::now();
+    let stop_flag = stop_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    
+    // Monitor thread
+    let global_best_mon = global_best.clone();
+    let stop_flag_mon = stop_flag.clone();
+    let total_iters_mon = total_iterations.clone();
+    let improvements_mon = improvements.clone();
+    let op_uses_mon = op_uses.clone();
+    let op_improvements_mon = op_improvements.clone();
+    let last_global_impr_mon = last_global_improvement.clone();
+    
+    let monitor = std::thread::spawn(move || {
+        let mut last_best = f64::INFINITY;
+        
+        while start.elapsed() < duration && !stop_flag_mon.load(Ordering::SeqCst) {
+            std::thread::sleep(status_interval);
+            
+            if stop_flag_mon.load(Ordering::SeqCst) {
+                break;
+            }
+            
+            let elapsed = start.elapsed().as_secs_f64();
+            let remaining = duration.as_secs_f64() - elapsed;
+            let iters = total_iters_mon.load(Ordering::Relaxed);
+            let impr = improvements_mon.load(Ordering::Relaxed);
+            let global_guard = global_best_mon.lock().unwrap();
+            let current_best = global_guard.1;
+            let current_best_sol = global_guard.0.to_string();
+            drop(global_guard);
+            let last_impr_secs = last_global_impr_mon.load(Ordering::Relaxed);
+            
+            let improved_marker = if current_best < last_best { " *** IMPROVED ***" } else { "" };
+            last_best = current_best;
+            
+            let op_stats: Vec<(u64, u64)> = op_uses_mon.iter()
+                .zip(op_improvements_mon.iter())
+                .map(|(u, i)| (u.load(Ordering::Relaxed), i.load(Ordering::Relaxed)))
+                .collect();
+            let mut op_weights: Vec<f64> = op_stats
+                .iter()
+                .map(|(uses, imps)| {
+                    if *uses > 0 { (*imps as f64 / *uses as f64).max(0.01) } else { 0.01 }
+                })
+                .collect();
+            let weight_sum: f64 = op_weights.iter().sum();
+            if weight_sum > 0.0 {
+                for w in &mut op_weights { *w /= weight_sum; }
+            }
+            
+            println!("\n╔══════════════════════════════════════════════════╗");
+            println!("║  STATUS UPDATE @ {:.0}s ({:.0}s remaining)", elapsed, remaining);
+            println!("╠══════════════════════════════════════════════════╣");
+            println!("║  Global best: {:.2}{}", current_best, improved_marker);
+            println!("║  Last global improvement: {}s ago", (elapsed as u64).saturating_sub(last_impr_secs));
+            println!("║  Total iterations: {} ({:.0}/sec)", iters, iters as f64 / elapsed);
+            println!("║  Improvements found: {}", impr);
+            println!("╠──────────────────────────────────────────────────╣");
+            println!("║  Operator Stats (uses / improvements / rate):");
+            for (i, (uses, imps)) in op_stats.iter().enumerate() {
+                let rate = if *uses > 0 { *imps as f64 / *uses as f64 * 100.0 } else { 0.0 };
+                println!("║    Op {}: {:>8} / {:>6} / {:>5.2}%", i, uses, imps, rate);
+            }
+            println!("║  Operator Weights: {:?}", op_weights);
+            println!("╠──────────────────────────────────────────────────╣");
+            println!("║  Best solution:");
+            println!("║  {}", current_best_sol);
+            println!("╚══════════════════════════════════════════════════╝\n");
+        }
+    });
+    
+    // Run all SA chains in parallel, distributing starting solutions round-robin
+    let explorer_count = ((num_chains as f64) * 0.30).ceil() as usize;
+    let solutions_ref: Vec<&Solution> = starting_solutions.iter().collect();
+    
+    (0..num_chains).into_par_iter().for_each(|chain_id| {
+        let sol_idx = chain_id % solutions_ref.len();
+        let init_sol = solutions_ref[sol_idx];
+        
+        run_sa_chain_with_counters(
+            chain_id,
+            init_sol,
+            instance,
+            operators,
+            duration,
+            sync_interval,
+            global_best.clone(),
+            stop_flag.clone(),
+            total_iterations.clone(),
+            improvements.clone(),
+            op_uses.clone(),
+            op_improvements.clone(),
+            last_global_improvement.clone(),
+            start,
+            chain_id < explorer_count,
+        );
+    });
+    
+    let _ = monitor.join();
+    
+    let (best_sol, best_score) = global_best.lock().unwrap().clone();
+    let total_iters = total_iterations.load(Ordering::Relaxed);
+    let total_impr = improvements.load(Ordering::Relaxed);
+    
+    println!("\n╔══════════════════════════════════════════╗");
+    println!("║     PARALLEL SA MULTI-START COMPLETE     ║");
     println!("╠══════════════════════════════════════════╣");
     println!("║  Total time: {:.1}s", start.elapsed().as_secs_f64());
     println!("║  Total iterations: {}", total_iters);
@@ -856,34 +1050,31 @@ fn run_sa_chain_with_counters(
     last_global_improvement: Arc<std::sync::atomic::AtomicU64>,
     start_time: Instant,
     is_explorer: bool,
-    seen_solutions: Arc<std::sync::Mutex<HashMap<String, u64>>>,
-    new_solutions_total: Arc<std::sync::atomic::AtomicU64>,
-    seen_window_secs: u64,
 ) {
     // Initialize chain
     let (delta_avg, mut incumbent, mut best_solution, mut incumbent_score, mut best_score) =
         estimate_avg_delta(init_solution, instance, operators, 0.8);
     
-    let t_zero = if delta_avg <= 0.0 { 1.0 } else { delta_avg / (-0.8f64.ln()) };
+    // Force a minimum temperature based on solution cost (same as timed SA)
+    let calibrated_t = if delta_avg <= 0.0 { 1.0 } else { delta_avg / (-0.8f64.ln()) };
+    let cost_based_t = best_score * 0.02;
+    let t_zero = calibrated_t.max(cost_based_t);
     let mut temp = t_zero;
-    let reheat_interval = 1_000_000;
+    let reheat_interval = 10_000;
     let mut no_improve_count = 0;
+    let mut reheat_count = 0u32;
+    
+    // Escape operators: varying sizes of destroy-repair
+    let escape_ops = [
+        DestroyRepair::new(12),
+        DestroyRepair::new(20),
+        DestroyRepair::new(30),
+    ];
     
     let start = Instant::now();
     let mut last_sync = Instant::now();
     let mut local_iters: u64 = 0;
-    let mut last_improvement = Instant::now();
-    let mut last_forced_escape = Instant::now();
-    let force_escape_after = if is_explorer {
-        Duration::from_secs(180)
-    } else {
-        Duration::from_secs(300)
-    };
-    let escape_destroy = if is_explorer {
-        DestroyRepair::new(40)
-    } else {
-        DestroyRepair::new(30)
-    };
+    let mut last_best_improvement = Instant::now();
     
     // Adaptive operator selection (ALNS-style)
     let mut selector = AdaptiveOperatorSelector::new(operators.len(), 0.8);
@@ -971,33 +1162,13 @@ fn run_sa_chain_with_counters(
         };
         
         let delta = new_score - incumbent_score;
-        let now_secs = start_time.elapsed().as_secs();
-        let is_new_solution = {
-            let mut seen = seen_solutions.lock().unwrap();
-            let key = new_solution.to_string();
-            match seen.get_mut(&key) {
-                Some(last_seen) => {
-                    let is_new = now_secs.saturating_sub(*last_seen) > seen_window_secs;
-                    *last_seen = now_secs;
-                    is_new
-                }
-                None => {
-                    seen.insert(key, now_secs);
-                    true
-                }
-            }
-        };
-        if is_new_solution {
-            new_solutions_total.fetch_add(1, Ordering::Relaxed);
-        }
-        let global_best_score = global_best.lock().unwrap().1;
+        
+        // Score operator performance WITHOUT mutex locks (use cached local best)
         let mut points = 0.0;
-        if new_score < global_best_score {
+        if new_score < best_score {
             points = 5.0;
         } else if new_score < incumbent_score {
             points = 3.0;
-        } else if is_new_solution {
-            points = 1.0;
         }
         if points > 0.0 {
             local_op_impr[op_idx] += points as u64;
@@ -1011,7 +1182,7 @@ fn run_sa_chain_with_counters(
             if new_score < best_score {
                 best_solution = incumbent.clone();
                 best_score = new_score;
-                last_improvement = Instant::now();
+                last_best_improvement = Instant::now();
             }
         } else {
             let p = (-delta / temp).exp();
@@ -1027,33 +1198,41 @@ fn run_sa_chain_with_counters(
         let alpha = 0.99999 - 0.00009 * (1.0 - progress);
         temp = (temp * alpha).max(0.001);
         
-        // Reheat if stuck
+        // Reheat + escape if stuck (iteration-based)
         if no_improve_count >= reheat_interval {
-            temp = t_zero * (0.3 + 0.4 * rand::random::<f64>());
-            incumbent = best_solution.clone();
-            incumbent_score = best_score;
+            reheat_count += 1;
+            temp = t_zero; // Full reheat
+            
+            // Use large destroy-repair on best solution to escape basin
+            let esc_idx = (reheat_count as usize) % escape_ops.len();
+            if let Some(escaped) = escape_ops[esc_idx].apply(&best_solution, instance) {
+                if let Ok(result) = escaped.verify_and_cost(instance) {
+                    incumbent = escaped;
+                    incumbent_score = result.total_time;
+                }
+            } else {
+                incumbent = best_solution.clone();
+                incumbent_score = best_score;
+            }
             no_improve_count = 0;
         }
 
-        // Force escape if no global improvement for a long time
-        let last_global_secs = last_global_improvement.load(Ordering::Relaxed);
-        let elapsed_secs = start_time.elapsed().as_secs();
-        if elapsed_secs.saturating_sub(last_global_secs) >= force_escape_after.as_secs()
-            && last_forced_escape.elapsed() >= force_escape_after
-        {
-            if let Some(escaped_sol) = escape_destroy.apply(&best_solution, instance) {
-                if let Ok(result) = escaped_sol.verify_and_cost(instance) {
-                    incumbent = escaped_sol;
+        // Mega escape if no new best for 120 seconds
+        if last_best_improvement.elapsed() >= Duration::from_secs(120) {
+            let mega_destroy = DestroyRepair::new(40);
+            if let Some(escaped) = mega_destroy.apply(&best_solution, instance) {
+                if let Ok(result) = escaped.verify_and_cost(instance) {
+                    incumbent = escaped;
                     incumbent_score = result.total_time;
+                    temp = t_zero * 1.5;
                     no_improve_count = 0;
-                    last_improvement = Instant::now();
-                    last_forced_escape = Instant::now();
                     println!(
-                        "[Chain {}] GLOBAL STAGNATION ESCAPE: destroy={} score {:.2} -> {:.2}",
-                        chain_id, escape_destroy.num_destroy, best_score, incumbent_score
+                        "[Chain {}] MEGA ESCAPE: destroy=40, score {:.2} -> {:.2}",
+                        chain_id, best_score, incumbent_score
                     );
                 }
             }
+            last_best_improvement = Instant::now();
         }
 
     }

@@ -405,7 +405,19 @@ pub fn alns_timed(
     time_limit: Duration,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Solution {
-    alns(init_solution, instance, operators, time_limit, stop_flag)
+    alns(init_solution, instance, operators, &[], time_limit, stop_flag)
+}
+
+/// ALNS with SA acceptance, adaptive weights, and configurable escape operators
+pub fn alns_with_escape(
+    init_solution: &Solution,
+    instance: &TruckAndDroneInstance,
+    operators: &[&(dyn Operator + Sync)],
+    escape_operators: &[&(dyn Operator + Sync)],
+    time_limit: Duration,
+    stop_flag: Option<Arc<AtomicBool>>,
+) -> Solution {
+    alns(init_solution, instance, operators, escape_operators, time_limit, stop_flag)
 }
 
 /// ALNS with SA acceptance and adaptive weights
@@ -413,6 +425,7 @@ pub fn alns(
     init_solution: &Solution,
     instance: &TruckAndDroneInstance,
     operators: &[&(dyn Operator + Sync)],
+    escape_operators: &[&(dyn Operator + Sync)],
     time_limit: Duration,
     stop_flag: Option<Arc<AtomicBool>>,
 ) -> Solution {
@@ -436,16 +449,12 @@ pub fn alns(
     let gamma = 0.2; // Weight adjustment factor (ALNS literature)
     let min_weight = 0.05;
     
-    // SA temperature setup
-    let t_zero = incumbent_cost * 0.05;
-    let t_final = t_zero * 0.001;
-    let mut temp = t_zero;
+    // Record-to-Record Travel: no temperature needed
     
-    // Shake heuristic (wild change) after xi * c non-improving iterations
+    // Escape: use escape_operators if provided, otherwise fall back to WildChange
     let shake = WildChange::new(2, 5);
-    let shake_interval = Duration::from_secs_f64(
-        (time_limit.as_secs_f64() * 0.02).max(0.5),
-    );
+    let has_escape_ops = !escape_operators.is_empty();
+    let escape_interval = Duration::from_secs(30);
     
     // let segment_duration = Duration::from_secs_f64(
     //     (time_limit.as_secs_f64() / 100.0).max(1.0),
@@ -457,7 +466,7 @@ pub fn alns(
     // CSV logging
     let file = File::create("alns_scores.csv").expect("failed to create csv");
     let mut writer = BufWriter::new(file);
-    let header = format!("elapsed_secs,iter,best,incumbent,temp,{}", 
+    let header = format!("elapsed_secs,iter,best,incumbent,deviation,{}", 
         (0..n_ops).map(|i| format!("w{}", i)).collect::<Vec<_>>().join(","));
     writeln!(writer, "{}", header).unwrap();
 
@@ -478,24 +487,45 @@ pub fn alns(
         iter += 1;
         
         if last_status.elapsed() >= status_interval {
+            let d = 0.2 * ((time_limit.as_secs_f64() - start.elapsed().as_secs_f64()) / time_limit.as_secs_f64()) * best_cost;
             println!(
-                "[{:.0}s] Iter {}: best = {:.2}, incumbent = {:.2}, temp = {:.4}, weights = {:?}",
+                "[{:.0}s] Iter {}: best = {:.2}, incumbent = {:.2}, deviation = {:.2}, weights = {:?}",
                 start.elapsed().as_secs_f64(),
                 iter,
                 best_cost,
                 incumbent_cost,
-                temp,
+                d,
                 weights
             );
             last_status = Instant::now();
         }
         
-        // Shake if stuck for long (time-based)
-        if last_improvement.elapsed() >= shake_interval {
-            if let Some(shaken) = shake.apply(&incumbent, instance) {
-                if let Ok(result) = shaken.verify_and_cost(instance) {
-                    incumbent = shaken;
-                    incumbent_cost = result.total_time;
+        // Escape if stuck for long (time-based)
+        if last_improvement.elapsed() >= escape_interval {
+            if has_escape_ops {
+                // Pick a random escape operator
+                let esc_idx = rng.random_range(0..escape_operators.len());
+                if let Some(escaped) = escape_operators[esc_idx].apply(&best_sol, instance) {
+                    if let Ok(result) = escaped.verify_and_cost(instance) {
+                        println!(
+                            "[{:.0}s] ESCAPE via op {}: {:.2} -> {:.2}",
+                            start.elapsed().as_secs_f64(), esc_idx, incumbent_cost, result.total_time
+                        );
+                        incumbent = escaped;
+                        incumbent_cost = result.total_time;
+                        if incumbent_cost < best_cost {
+                            best_sol = incumbent.clone();
+                            best_cost = incumbent_cost;
+                        }
+                    }
+                }
+            } else {
+                // Fallback: WildChange shake
+                if let Some(shaken) = shake.apply(&incumbent, instance) {
+                    if let Ok(result) = shaken.verify_and_cost(instance) {
+                        incumbent = shaken;
+                        incumbent_cost = result.total_time;
+                    }
                 }
             }
             last_improvement = Instant::now();
@@ -516,32 +546,31 @@ pub fn alns(
         };
         let is_new_solution = seen_solutions.insert(new_solution.to_string());
         
-        let delta = new_cost - incumbent_cost;
+        // Record-to-Record Travel acceptance
+        let remaining = (time_limit.as_secs_f64() - start.elapsed().as_secs_f64()).max(0.0);
+        let d = 0.2 * (remaining / time_limit.as_secs_f64()) * best_cost;
         
-        let prev_incumbent_cost = incumbent_cost;
-        let mut accepted = false;
-        if delta < 0.0 {
-            accepted = true;
-        } else {
-            let p = (-delta / temp).exp();
-            if rng.random::<f64>() < p {
-                accepted = true;
-            }
-        }
-        
-        if accepted {
+        if new_cost < incumbent_cost {
+            // Improving move - always accept
             incumbent = new_solution.clone();
             incumbent_cost = new_cost;
-        }
-        
-        if new_cost < best_cost {
-            operator_points[op_idx] += 5.0;
-            best_cost = new_cost;
-            best_sol = new_solution;
-            last_improvement = Instant::now();
-        } else if new_cost < prev_incumbent_cost {
-            operator_points[op_idx] += 3.0;
-            last_improvement = Instant::now();
+
+            if incumbent_cost < best_cost {
+                operator_points[op_idx] += 5.0;
+                best_cost = incumbent_cost;
+                best_sol = incumbent.clone();
+                last_improvement = Instant::now();
+            } else {
+                operator_points[op_idx] += 3.0;
+                last_improvement = Instant::now();
+            }
+        } else if new_cost < best_cost + d {
+            // Within allowed deviation from record - accept
+            incumbent = new_solution.clone();
+            incumbent_cost = new_cost;
+            if is_new_solution {
+                operator_points[op_idx] += 1.0;
+            }
         } else if is_new_solution {
             operator_points[op_idx] += 1.0;
         }
@@ -577,14 +606,11 @@ pub fn alns(
                 iter,
                 best_cost,
                 incumbent_cost,
-                temp,
+                d,
                 weights_str
             ).unwrap();
             last_log = Instant::now();
         }
-
-        let progress = (start.elapsed().as_secs_f64() / time_limit.as_secs_f64()).min(1.0);
-        temp = t_zero * (t_final / t_zero).powf(progress);
     }
     
     let stopped_early = should_stop();
