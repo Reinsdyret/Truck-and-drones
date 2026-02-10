@@ -926,7 +926,7 @@ fn run_sa_chain_with_counters(
                 global.1 = best_score;
                 improvements.fetch_add(1, Ordering::Relaxed);
                 last_global_improvement.store(start_time.elapsed().as_secs(), Ordering::Relaxed);
-                println!("[Chain {}] NEW GLOBAL BEST: {:.2}", chain_id, best_score);
+                println!("[Chain {}] NEW GLOBAL BEST: {:.2} {}", chain_id, best_score, best_solution);
             }
             
             if global.1 < best_score || rand::random::<f64>() < 0.3 {
