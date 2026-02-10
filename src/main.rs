@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use Truck_and_drones::simulated_annealing::{run_parallel_sa, setup_stop_signal};
 use Truck_and_drones::{parse_file, Solution};
-use Truck_and_drones::operators::{DestroyRepair, GreedyReinsertSmart, TwoOptTruck, GreedyDroneAssign, GreedyReinsert, GreedyReinsertFast,MoveToDrone,MoveToTruck,ThreeOptTruck,GreedyAssignment,WildChange,SwapTruckCustomers,RelocateTruck};
+use Truck_and_drones::operators::{DestroyRepair, GreedyReinsertSmart, TwoOptTruck};
 
 fn main() {
     let file = "src/data/Truck_Drone_Contest.txt";
@@ -17,31 +17,11 @@ fn main() {
     let smart_op = GreedyReinsertSmart::new(15);
     let destroy_4 = DestroyRepair::new(4);
     let two_opt = TwoOptTruck;
-    let gda = GreedyDroneAssign;
-    let gr = GreedyReinsert;
-    let grf = GreedyReinsertFast::new(20);
-    let mtd = MoveToDrone;
-    let mtt = MoveToTruck;
-    let tot = ThreeOptTruck;
-    let ga = GreedyAssignment;
-    let wc = WildChange::new(1,15);
-    let stc = SwapTruckCustomers;
-    let rt = RelocateTruck;
     
     let operators: Vec<&(dyn Truck_and_drones::operators::Operator + Sync)> = vec![
         &smart_op,
         &destroy_4,
         &two_opt,
-        &gda,
-        &gr,
-        &grf,
-        &mtd,
-        &mtt,
-        &tot,
-        &ga,
-        &wc,
-        &stc,
-        &rt,
     ];
 
     // Set up Ctrl+C handler for graceful stopping

@@ -917,7 +917,8 @@ fn run_sa_chain_with_counters(
             selector.update_weights();
         }
         
-        // Periodic sync with global best
+        // Periodic sync DISABLED: chains run fully independently.
+        // Only push local best to global (no adopting other chains' solutions).
         if !is_explorer && last_sync.elapsed() >= sync_interval {
             let mut global = global_best.lock().unwrap();
             
@@ -927,13 +928,6 @@ fn run_sa_chain_with_counters(
                 improvements.fetch_add(1, Ordering::Relaxed);
                 last_global_improvement.store(start_time.elapsed().as_secs(), Ordering::Relaxed);
                 println!("[Chain {}] NEW GLOBAL BEST: {:.2} {}", chain_id, best_score, best_solution);
-            }
-            
-            if global.1 < best_score || rand::random::<f64>() < 0.3 {
-                best_solution = global.0.clone();
-                best_score = global.1;
-                incumbent = best_solution.clone();
-                incumbent_score = best_score;
             }
             
             drop(global);
@@ -1102,7 +1096,7 @@ fn run_sa_chain(
     while start.elapsed() < duration && !stop_flag.load(Ordering::SeqCst) {
         iter += 1;
         
-        // === Periodic sync with global best ===
+        // === Periodic sync with global best (push only, no adopting) ===
         if last_sync.elapsed() >= sync_interval {
             let mut global = global_best.lock().unwrap();
             
@@ -1111,18 +1105,9 @@ fn run_sa_chain(
                 global.0 = best_solution.clone();
                 global.1 = best_score;
                 println!(
-                    "[Chain {}] {:.0}s: NEW GLOBAL BEST {:.2}",
-                    chain_id, start.elapsed().as_secs_f64(), best_score
+                    "[Chain {}] {:.0}s: NEW GLOBAL BEST {:.2} {}",
+                    chain_id, start.elapsed().as_secs_f64(), best_score, best_solution
                 );
-            }
-            
-            // Adopt global best if it's better than ours (with some probability)
-            if global.1 < best_score || rand::random::<f64>() < 0.3 {
-                best_solution = global.0.clone();
-                best_score = global.1;
-                // Restart from global best with perturbation
-                incumbent = best_solution.clone();
-                incumbent_score = best_score;
             }
             
             drop(global);
