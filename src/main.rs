@@ -37,9 +37,9 @@ fn main() {
         &solution,
         &instance,
         &operators,
-        Duration::from_secs(60 * 60 * 10),
+        Duration::from_secs(60 * 30),
         worker_chains,
-        Duration::from_secs(60),
+        Duration::from_secs(30),
         Some(stop_flag),
     );
     // let best = alns_timed(
